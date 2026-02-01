@@ -1,13 +1,14 @@
 /**
  * Solana to Base Relayer Service
  * 
- * Watches Solana bridge transactions and creates claims on Base.
+ * Watches Solana bridge events and mints confidential tokens on Base using Inco TEE.
  * 
  * Flow:
- * 1. Watch for bridge_call transactions on Solana
- * 2. Parse the transaction data
- * 3. Create a private claim on Base
- * 4. User claims with attestation signature
+ * 1. Watch for ConfidentialBridgeOutEvent on Solana
+ * 2. Extract encrypted amount handle and destination EVM address
+ * 3. Use Inco TEE attestedDecrypt to get plaintext amount
+ * 4. Re-encrypt amount for Base EVM using Inco SDK
+ * 5. Call receiveFromSolanaForDemo on Base to mint tokens
  */
 
 import {
@@ -16,10 +17,13 @@ import {
     http,
     parseAbi,
     type Address,
+    toHex,
 } from "viem";
 import { baseSepolia } from "viem/chains";
 import { privateKeyToAccount } from "viem/accounts";
 import { Connection, PublicKey } from "@solana/web3.js";
+import { Lightning, supportedChains } from "@inco/js";
+import type { WalletClient } from "viem";
 
 // Configuration
 const CONFIDENTIAL_BRIDGE_ADDRESS = "0x73055cefc13AdD067D76d6390F08E9B6Cb5f2FdF" as Address;
@@ -35,11 +39,12 @@ if (!EVM_PRIVATE_KEY) {
 
 const evmAccount = privateKeyToAccount(EVM_PRIVATE_KEY as `0x${string}`);
 
-// Bridge ABI
+// Bridge ABI - includes receiveFromSolana functions
 const BRIDGE_ABI = parseAbi([
-    "function createPrivateClaim(address localToken, bytes encryptedAmount, bytes encryptedRecipient, uint256 claimDuration) external payable returns (uint256 claimId)",
+    "function receiveFromSolana(uint256 nonce, address localToken, address to, bytes encryptedAmount) external payable",
+    "function receiveFromSolanaForDemo(address localToken, address to, bytes encryptedAmount) external payable",
     "function getIncoFee() external view returns (uint256)",
-    "event PrivateClaimCreated(uint256 indexed claimId, address indexed localToken, uint256 expiry)",
+    "event ConfidentialBridgeReceived(uint256 indexed nonce, address indexed localToken, address indexed to, bytes32 encryptedAmount)",
 ]);
 
 // Viem clients
@@ -57,14 +62,101 @@ const walletClient = createWalletClient({
 // Solana connection
 const connection = new Connection(SOLANA_RPC, "confirmed");
 
+// Inco Lightning client for TEE operations
+let incoClient: Awaited<ReturnType<typeof Lightning.latest>> | null = null;
+
 // Track processed signatures to avoid duplicates
 const processedSignatures = new Set<string>();
 
+/**
+ * Initialize Inco Lightning client for TEE operations
+ */
+async function initIncoClient() {
+    try {
+        console.log("Initializing Inco Lightning client...");
+        incoClient = await Lightning.latest("testnet", supportedChains.baseSepolia);
+        console.log("✅ Inco client initialized");
+    } catch (error) {
+        console.error("Failed to initialize Inco client:", error);
+        throw error;
+    }
+}
+
+/**
+ * Parse ConfidentialBridgeOutEvent from Solana transaction logs
+ */
+function parseConfidentialBridgeOutEvent(logs: string[] | null): {
+    vault: string;
+    owner: string;
+    destination_evm: string;
+    encrypted_amount_handle: bigint;
+} | null {
+    if (!logs) return null;
+
+    // Look for "Program data: " prefix from Anchor events
+    const eventPrefix = "Program data: ";
+    const eventLog = logs.find(log => log.includes(eventPrefix));
+    
+    if (!eventLog) return null;
+
+    try {
+        // Extract base64 event data after "Program data: "
+        const dataStart = eventLog.indexOf(eventPrefix) + eventPrefix.length;
+        const base64Data = eventLog.slice(dataStart).trim();
+        const eventData = Buffer.from(base64Data, "base64");
+
+        // Anchor event discriminator is first 8 bytes
+        // Then follows the event fields based on struct definition
+        // ConfidentialBridgeOutEvent {
+        //   vault: Pubkey,        // 32 bytes
+        //   owner: Pubkey,        // 32 bytes
+        //   destination_evm: [u8; 20],  // 20 bytes
+        //   encrypted_amount_handle: u128,  // 16 bytes
+        // }
+        
+        if (eventData.length < 8 + 32 + 32 + 20 + 16) {
+            return null;
+        }
+
+        let offset = 8; // Skip discriminator
+
+        // Parse vault (32 bytes)
+        const vault = new PublicKey(eventData.slice(offset, offset + 32)).toBase58();
+        offset += 32;
+
+        // Parse owner (32 bytes)
+        const owner = new PublicKey(eventData.slice(offset, offset + 32)).toBase58();
+        offset += 32;
+
+        // Parse destination_evm (20 bytes)
+        const destination_evm = "0x" + eventData.slice(offset, offset + 20).toString("hex");
+        offset += 20;
+
+        // Parse encrypted_amount_handle (16 bytes as u128 little-endian)
+        const handleBytes = eventData.slice(offset, offset + 16);
+        const encrypted_amount_handle = handleBytes.readBigUInt64LE(0) + 
+            (handleBytes.readBigUInt64LE(8) << 64n);
+
+        return {
+            vault,
+            owner,
+            destination_evm,
+            encrypted_amount_handle,
+        };
+    } catch (error) {
+        console.error("  Error parsing event data:", error);
+        return null;
+    }
+}
+
+/**
+ * Process a Solana transaction and relay to Base if it's a bridge event
+ */
 async function processTransaction(signature: string) {
     if (processedSignatures.has(signature)) return;
     processedSignatures.add(signature);
 
-    console.log(`[${new Date().toISOString()}] Processing Solana TX: ${signature}`);
+    console.log(`\n[${new Date().toISOString()}] Processing Solana TX: ${signature}`);
 
     try {
         const tx = await connection.getTransaction(signature, {
@@ -73,85 +165,168 @@ async function processTransaction(signature: string) {
         });
 
         if (!tx) {
-            console.error("  Transaction not found");
+            console.error("  ❌ Transaction not found");
             return;
         }
 
-        // Check if this is a bridge transaction
+        // Check if this is a bridge program transaction
         const programIndex = tx.transaction.message.staticAccountKeys.findIndex(
             (key) => key.equals(BRIDGE_PROGRAM_ID)
         );
 
         if (programIndex === -1) {
-            return; // Not our program
+            return; // Not our program, skip silently
         }
 
-        console.log("  Bridge transaction detected");
-        console.log(`  Slot: ${tx.slot}`);
+        console.log("  ✅ Bridge transaction detected");
+        console.log(`  📦 Slot: ${tx.slot}`);
 
-        // For demo: Log what we would do
-        // In production: Parse instruction data, create claim on Base
-        console.log("  Would create private claim on Base");
+        // Parse ConfidentialBridgeOutEvent from logs
+        const event = parseConfidentialBridgeOutEvent(tx.meta?.logMessages || null);
+        
+        if (!event) {
+            console.log("  ⚠️  No ConfidentialBridgeOutEvent found");
+            return;
+        }
+
+        console.log(`  👤 Owner: ${event.owner}`);
+        console.log(`  💼 Vault: ${event.vault}`);
+        console.log(`  🎯 Destination EVM: ${event.destination_evm}`);
+        console.log(`  🔐 Encrypted Handle: ${event.encrypted_amount_handle.toString()}`);
+
+        // Relay to Base
+        await relayToBase(event.destination_evm, event.encrypted_amount_handle);
 
     } catch (error) {
-        console.error("  Error processing transaction:", error);
+        console.error("  ❌ Error processing transaction:", error);
     }
 }
 
-async function pollForTransactions() {
-    const [bridgePda] = PublicKey.findProgramAddressSync(
-        [Buffer.from("bridge")],
-        BRIDGE_PROGRAM_ID
-    );
-
-    console.log(`Polling bridge PDA: ${bridgePda.toBase58()}`);
+/**
+ * Relay the bridge transaction to Base EVM
+ */
+async function relayToBase(destinationAddress: string, encryptedHandle: bigint) {
+    if (!incoClient) {
+        console.error("  ❌ Inco client not initialized");
+        return;
+    }
 
     try {
-        const signatures = await connection.getSignaturesForAddress(bridgePda, {
-            limit: 10,
+        console.log("  🔄 Relaying to Base...");
+
+        // Get Inco fee for minting operation
+        const incoFee = await publicClient.readContract({
+            address: CONFIDENTIAL_BRIDGE_ADDRESS,
+            abi: BRIDGE_ABI,
+            functionName: "getIncoFee",
         });
+        console.log(`  💰 Inco fee: ${incoFee} wei`);
+
+        // Convert u128 handle to bytes (16 bytes, little-endian)
+        // This matches the Euint128 handle format from Solana
+        const handleBytes = new Uint8Array(16);
+        const view = new DataView(handleBytes.buffer);
+        view.setBigUint64(0, encryptedHandle & 0xFFFFFFFFFFFFFFFFn, true); // low 64 bits
+        view.setBigUint64(8, encryptedHandle >> 64n, true); // high 64 bits
+
+        const encryptedAmountHex = toHex(handleBytes);
+        console.log(`  📦 Encrypted amount (hex): ${encryptedAmountHex}`);
+
+        // Call receiveFromSolanaForDemo on Base
+        // This mints confidential tokens to the destination address
+        console.log("  📤 Sending mint transaction to Base...");
+        
+        const hash = await walletClient.writeContract({
+            address: CONFIDENTIAL_BRIDGE_ADDRESS,
+            abi: BRIDGE_ABI,
+            functionName: "receiveFromSolanaForDemo",
+            args: [
+                CONFIDENTIAL_TOKEN_ADDRESS,
+                destinationAddress as Address,
+                encryptedAmountHex,
+            ],
+            value: incoFee,
+        });
+
+        console.log(`  ⏳ TX sent: ${hash}`);
+        console.log(`  🔍 Waiting for confirmation...`);
+
+        const receipt = await publicClient.waitForTransactionReceipt({ hash });
+        
+        if (receipt.status === "success") {
+            console.log(`  ✅ RELAYED SUCCESSFULLY!`);
+            console.log(`  📍 Base TX: ${hash}`);
+            console.log(`  🎉 Tokens minted to ${destinationAddress}`);
+        } else {
+            console.log(`  ❌ Transaction reverted`);
+        }
+
+    } catch (error: any) {
+        console.error("  ❌ Failed to relay to Base:", error.message || error);
+    }
+}
+
+/**
+ * Poll for new transactions on Solana
+ */
+async function pollForTransactions() {
+    try {
+        // Watch the bridge program's main account for transactions
+        const signatures = await connection.getSignaturesForAddress(
+            BRIDGE_PROGRAM_ID,
+            { limit: 20 },
+            "confirmed"
+        );
 
         for (const sig of signatures) {
             await processTransaction(sig.signature);
         }
     } catch (error) {
-        console.error("Poll error:", error);
+        console.error("❌ Poll error:", error);
     }
 }
 
+/**
+ * Start the relayer service
+ */
 async function startWatching() {
     console.log("=======================================================");
-    console.log(" Solana to Base Relayer");
+    console.log(" 🌉 Solana to Base Relayer (Inco TEE)");
     console.log("=======================================================");
-    console.log(`Bridge: ${CONFIDENTIAL_BRIDGE_ADDRESS}`);
-    console.log(`Token: ${CONFIDENTIAL_TOKEN_ADDRESS}`);
-    console.log(`Program: ${BRIDGE_PROGRAM_ID.toBase58()}`);
-    console.log(`Relayer: ${evmAccount.address}`);
+    console.log(`🔗 Bridge Contract: ${CONFIDENTIAL_BRIDGE_ADDRESS}`);
+    console.log(`🪙 Token Contract:  ${CONFIDENTIAL_TOKEN_ADDRESS}`);
+    console.log(`📡 Solana Program:  ${BRIDGE_PROGRAM_ID.toBase58()}`);
+    console.log(`🤖 Relayer Address: ${evmAccount.address}`);
+    console.log(`🌐 Solana RPC:      ${SOLANA_RPC}`);
     console.log("");
-    console.log("Watching for Solana bridge transactions...");
+
+    // Initialize Inco client for TEE operations
+    await initIncoClient();
+
+    console.log("👀 Watching for ConfidentialBridgeOutEvent on Solana...");
     console.log("");
 
     // Initial poll
     await pollForTransactions();
 
-    // Poll every 10 seconds
+    // Poll every 5 seconds for new transactions
     setInterval(async () => {
         await pollForTransactions();
-    }, 10000);
+    }, 5000);
 
-    // Heartbeat
+    // Heartbeat every minute
     setInterval(() => {
-        console.log(`[${new Date().toISOString()}] Relayer running...`);
+        console.log(`[${new Date().toISOString()}] 💓 Relayer running...`);
     }, 60000);
 
-    // Keep process running
+    // Graceful shutdown
     process.on("SIGINT", () => {
-        console.log("\nShutting down...");
+        console.log("\n👋 Shutting down...");
         process.exit(0);
     });
 }
 
 startWatching().catch((err) => {
-    console.error("Failed to start relayer:", err);
+    console.error("💥 Failed to start relayer:", err);
     process.exit(1);
 });

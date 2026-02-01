@@ -2,6 +2,7 @@
 pragma solidity ^0.8.28;
 
 import {euint256, ebool, eaddress, e, inco} from "@inco/lightning/Lib.sol";
+import {DecryptionAttestation} from "@inco/lightning/lightning-parts/DecryptionAttester.types.sol";
 import {ReentrancyGuardTransient} from "solady/utils/ReentrancyGuardTransient.sol";
 import {OwnableRoles} from "solady/auth/OwnableRoles.sol";
 import {Initializable} from "solady/utils/Initializable.sol";
@@ -97,6 +98,11 @@ contract ConfidentialBridge is ReentrancyGuardTransient, OwnableRoles, Initializ
     /// @notice Counter for private claim IDs.
     uint256 public privateClaimIdCounter;
 
+    /// @notice The designated bridge relayer for cross-chain transfers.
+    /// @dev This address is granted e.allow() on bridged amounts so it can
+    ///      perform attested decrypt on EVM and re-encrypt for Solana TEE.
+    address public bridgeRelayer;
+
     //////////////////////////////////////////////////////////////
     ///                       Events                           ///
     //////////////////////////////////////////////////////////////
@@ -158,6 +164,17 @@ contract ConfidentialBridge is ReentrancyGuardTransient, OwnableRoles, Initializ
         address indexed recipient
     );
 
+    /// @notice Emitted when a confidential bridge is initiated with user-attested plaintext.
+    /// @dev The plaintext amount is verified by Inco covalidator signatures on-chain.
+    ///      This enables relayer to read verified amount without needing attestedDecrypt.
+    event ConfidentialBridgeInitiatedWithPlaintext(
+        uint256 indexed nonce,
+        address indexed localToken,
+        Pubkey indexed remoteToken,
+        bytes32 toSolana,
+        uint256 plaintextAmount
+    );
+
     //////////////////////////////////////////////////////////////
     ///                       Errors                           ///
     //////////////////////////////////////////////////////////////
@@ -185,6 +202,9 @@ contract ConfidentialBridge is ReentrancyGuardTransient, OwnableRoles, Initializ
 
     /// @notice Emitted when pause state changes.
     event PauseStateChanged(bool paused);
+
+    /// @notice Emitted when bridge relayer is set.
+    event BridgeRelayerSet(address indexed bridgeRelayer);
 
     //////////////////////////////////////////////////////////////
     ///                       Modifiers                        ///
@@ -247,6 +267,16 @@ contract ConfidentialBridge is ReentrancyGuardTransient, OwnableRoles, Initializ
     /// @notice Remove a relayer.
     function removeRelayer(address relayer) external onlyOwner {
         _removeRoles(relayer, RELAYER_ROLE);
+    }
+
+    /// @notice Set the designated bridge relayer for cross-chain re-encryption.
+    /// @dev The bridge relayer is granted e.allow() on all bridged amounts so it can
+    ///      perform attested decrypt on EVM and re-encrypt for Solana TEE.
+    /// @param _bridgeRelayer The address of the bridge relayer.
+    function setBridgeRelayer(address _bridgeRelayer) external onlyOwner {
+        require(_bridgeRelayer != address(0), ZeroAddress());
+        bridgeRelayer = _bridgeRelayer;
+        emit BridgeRelayerSet(_bridgeRelayer);
     }
 
     //////////////////////////////////////////////////////////////
@@ -621,6 +651,11 @@ contract ConfidentialBridge is ReentrancyGuardTransient, OwnableRoles, Initializ
         // Allow both this contract AND the token contract to use the handle
         e.allow(amount, address(this));
         e.allow(amount, localToken);
+        
+        // CRITICAL: Mark handle for public decryption so relayer can use attestedReveal()
+        // This is required because attestedDecrypt() requires the user's wallet signature,
+        // but attestedReveal() works for handles marked with e.reveal()
+        e.reveal(amount);
 
         // Burn from sender's confidential balance using the handle (not the raw ciphertext)
         // This avoids calling newEuint256 twice on the same ciphertext
@@ -667,6 +702,9 @@ contract ConfidentialBridge is ReentrancyGuardTransient, OwnableRoles, Initializ
         // Allow both this contract AND the token contract to use the handle
         e.allow(amount, address(this));
         e.allow(amount, localToken);
+        
+        // CRITICAL: Mark handle for public decryption so relayer can use attestedReveal()
+        e.reveal(amount);
 
         // Burn from sender's confidential balance using the handle (not the raw ciphertext)
         ConfidentialCrossChainERC20(localToken).confidentialBurnFromHandle(
@@ -690,6 +728,115 @@ contract ConfidentialBridge is ReentrancyGuardTransient, OwnableRoles, Initializ
         );
 
         // TODO: Serialize and emit instructions for Solana relay
+    }
+
+    /// @notice Bridge tokens privately to Solana with user-provided attestation.
+    /// @dev PRODUCTION APPROACH: User calls attestedDecrypt() in frontend, gets DecryptionAttestation,
+    ///      then submits it here. Contract verifies covalidator signatures on-chain and emits
+    ///      verified plaintext in event. Relayer reads plaintext (no decryption needed) and
+    ///      re-encrypts for Solana using encryptValue().
+    /// @param localToken The confidential token to bridge.
+    /// @param toSolana The recipient's Solana pubkey.
+    /// @param encryptedAmount Client-encrypted amount ciphertext for burning.
+    /// @param decryption The DecryptionAttestation containing handle and plaintext value.
+    /// @param signatures The covalidator signatures over the attestation.
+    function bridgePrivateToSolanaWithAttestation(
+        address localToken,
+        bytes32 toSolana,
+        bytes calldata encryptedAmount,
+        DecryptionAttestation memory decryption,
+        bytes[] memory signatures
+    ) external payable nonReentrant whenNotPaused requiresFee {
+        require(localToken != address(0), ZeroAddress());
+        require(toSolana != bytes32(0), ZeroAddress());
+
+        // 1. Verify covalidator signatures on the attestation
+        if (!inco.incoVerifier().isValidDecryptionAttestation(decryption, signatures)) {
+            revert InvalidAttestation();
+        }
+
+        // 2. Create encrypted handle from ciphertext
+        euint256 amount = encryptedAmount.newEuint256(msg.sender);
+        e.allow(amount, address(this));
+        e.allow(amount, localToken);
+
+        // 3. Verify the attestation handle matches the amount handle
+        if (euint256.unwrap(amount) != decryption.handle) {
+            revert HandleMismatch();
+        }
+
+        // 4. Extract verified plaintext from attestation
+        uint256 plaintextAmount = uint256(decryption.value);
+        require(plaintextAmount > 0, ZeroAddress());
+
+        // 5. Burn from sender's confidential balance
+        ConfidentialCrossChainERC20(localToken).confidentialBurnFromHandle(
+            msg.sender,
+            amount
+        );
+
+        // 6. Get remote token mapping
+        Pubkey remoteToken = Pubkey.wrap(
+            ConfidentialCrossChainERC20(localToken).remoteToken()
+        );
+
+        // 7. Increment nonce
+        uint256 nonce = confidentialNonce++;
+
+        // 8. Emit event with VERIFIED PLAINTEXT for relayer
+        //    Relayer reads this plaintext and re-encrypts for Solana using encryptValue()
+        emit ConfidentialBridgeInitiatedWithPlaintext(
+            nonce,
+            localToken,
+            remoteToken,
+            toSolana,
+            plaintextAmount
+        );
+    }
+
+    /// @notice Bridge tokens to Solana with plaintext amount (simpler approach).
+    /// @dev User provides plaintext amount, contract encrypts and burns from balance.
+    ///      Emits plaintext for relayer. FHE balance check ensures user has sufficient funds.
+    /// @param localToken The confidential token to bridge.
+    /// @param toSolana The recipient's Solana pubkey.
+    /// @param amount The plaintext amount to bridge.
+    function bridgePrivateToSolanaPlaintext(
+        address localToken,
+        bytes32 toSolana,
+        uint256 amount
+    ) external payable nonReentrant whenNotPaused requiresFee {
+        require(localToken != address(0), ZeroAddress());
+        require(toSolana != bytes32(0), ZeroAddress());
+        require(amount > 0, ZeroAddress());
+
+        // 1. Encrypt the plaintext amount on-chain (trivial encrypt)
+        euint256 encryptedAmount = e.asEuint256(amount);
+        e.allow(encryptedAmount, address(this));
+        e.allow(encryptedAmount, localToken);
+
+        // 2. Burn from sender's confidential balance
+        //    FHE comparison (e.ge) ensures user has sufficient balance
+        ConfidentialCrossChainERC20(localToken).confidentialBurnFromHandle(
+            msg.sender,
+            encryptedAmount
+        );
+
+        // 3. Get remote token mapping
+        Pubkey remoteToken = Pubkey.wrap(
+            ConfidentialCrossChainERC20(localToken).remoteToken()
+        );
+
+        // 4. Increment nonce
+        uint256 nonce = confidentialNonce++;
+
+        // 5. Emit event with plaintext for relayer
+        emit ConfidentialBridgeInitiatedWithPlaintext(
+            nonce,
+            localToken,
+            remoteToken,
+            toSolana,
+            amount
+        );
     }
 
     /// @notice Receive confidential tokens from Solana.

@@ -59,7 +59,7 @@ export const CONFIGS = {
   "testnet-alpha": {
     solana: {
       cluster: "devnet",
-      rpcUrl: "https://api.devnet.solana.com",
+      rpcUrl: "https://devnet.helius-rpc.com/?api-key=fc797121-f238-485c-8133-5c36c245649c",
 
       // Keypairs
       deployerKpPath: "keypairs/deployer.devnet.alpha.json",

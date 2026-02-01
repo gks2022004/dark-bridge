@@ -50,6 +50,85 @@ pub fn initialize_confidential_vault<'info>(
     Ok(())
 }
 
+/// Bridge tokens confidentially from Solana to Base (plaintext amount).
+/// 
+/// This burns encrypted tokens from the user's vault and emits a bridge message.
+/// The amount is provided as plaintext and trivially encrypted on-chain.
+/// 
+/// For cross-chain TEE: The plaintext amount is emitted in the event so the relayer
+/// can mint the exact amount on Base without needing to decrypt.
+pub fn bridge_confidential_out_plaintext<'info>(
+    ctx: Context<'_, '_, '_, 'info, BridgeConfidentialOut<'info>>,
+    plaintext_amount: u128,
+    destination_evm: [u8; 20],
+) -> Result<()> {
+    let vault = &mut ctx.accounts.vault;
+    let inco = ctx.accounts.inco_lightning_program.to_account_info();
+    let signer = ctx.accounts.owner.to_account_info();
+
+    // Create encrypted handle from plaintext amount (trivial encryption)
+    let cpi_ctx = CpiContext::new(inco.clone(), Operation { signer: signer.clone() });
+    let amount: Euint128 = as_euint128(cpi_ctx, plaintext_amount)?;
+
+    // Check if vault has sufficient balance
+    let cpi_ctx = CpiContext::new(inco.clone(), Operation { signer: signer.clone() });
+    let has_sufficient: Ebool = e_ge(cpi_ctx, vault.encrypted_balance, amount, 0)?;
+
+    // Create zero for failed case
+    let cpi_ctx = CpiContext::new(inco.clone(), Operation { signer: signer.clone() });
+    let zero = as_euint128(cpi_ctx, 0)?;
+
+    // Select actual amount to bridge (0 if insufficient)
+    let cpi_ctx = CpiContext::new(inco.clone(), Operation { signer: signer.clone() });
+    let actual_amount: Euint128 = e_select(cpi_ctx, has_sufficient, amount, zero, 0)?;
+
+    // Subtract from vault balance
+    let cpi_ctx = CpiContext::new(inco.clone(), Operation { signer: signer.clone() });
+    let new_balance: Euint128 = e_sub(cpi_ctx, vault.encrypted_balance, actual_amount, 0)?;
+    vault.encrypted_balance = new_balance;
+
+    // Grant allowance to owner for updated balance
+    if ctx.remaining_accounts.len() >= 2 {
+        let cpi_ctx = CpiContext::new(
+            inco.clone(),
+            Allow {
+                allowance_account: ctx.remaining_accounts[0].clone(),
+                signer: signer.clone(),
+                allowed_address: ctx.remaining_accounts[1].clone(),
+                system_program: ctx.accounts.system_program.to_account_info(),
+            },
+        );
+        allow(cpi_ctx, new_balance.0, true, vault.owner)?;
+
+        // Also allow for actual_amount (so user can decrypt via attested decrypt if needed)
+        // This enables verification and debugging even when using plaintext flow
+        if ctx.remaining_accounts.len() >= 4 {
+            let cpi_ctx = CpiContext::new(
+                inco.clone(),
+                Allow {
+                    allowance_account: ctx.remaining_accounts[2].clone(),
+                    signer: signer.clone(),
+                    allowed_address: ctx.remaining_accounts[3].clone(),
+                    system_program: ctx.accounts.system_program.to_account_info(),
+                },
+            );
+            allow(cpi_ctx, actual_amount.0, true, vault.owner)?;
+        }
+    }
+
+    // Emit bridge message event with PLAINTEXT amount for cross-chain relay
+    // This allows the relayer to mint the exact amount on Base without decryption
+    emit!(ConfidentialBridgeOutPlaintextEvent {
+        vault: vault.key(),
+        owner: vault.owner,
+        destination_evm,
+        encrypted_amount_handle: amount.0,
+        plaintext_amount, // Include plaintext for relayer
+    });
+
+    Ok(())
+}
+
 /// Bridge tokens confidentially from Solana to Base.
 /// 
 /// This burns encrypted tokens from the user's vault and emits a bridge message.
@@ -1137,6 +1216,17 @@ pub struct ConfidentialBridgeOutEvent {
     pub owner: Pubkey,
     pub destination_evm: [u8; 20],
     pub encrypted_amount_handle: u128,
+}
+
+/// Event emitted when bridging with plaintext amount (for cross-chain TEE).
+/// Includes the plaintext amount so the relayer can mint exact amount on Base.
+#[event]
+pub struct ConfidentialBridgeOutPlaintextEvent {
+    pub vault: Pubkey,
+    pub owner: Pubkey,
+    pub destination_evm: [u8; 20],
+    pub encrypted_amount_handle: u128,
+    pub plaintext_amount: u128,
 }
 
 #[event]
