@@ -7,10 +7,15 @@ use inco_lightning::types::Euint128;
 ///
 /// This account stores an encrypted balance using Inco's Euint128 type,
 /// which is a 128-bit handle to encrypted data stored off-chain by the covalidator.
+///
+/// PRIVACY: The vault stores a keccak256 hash of the owner's pubkey instead of
+/// the raw pubkey. This prevents explorers from linking vaults to wallet addresses.
+/// Only the owner (who knows their own pubkey) can derive and find their vault.
 #[account]
 pub struct ConfidentialVault {
-    /// The owner of this vault (can authorize transfers out).
-    pub owner: Pubkey,
+    /// Keccak256 hash of the owner's pubkey (privacy-preserving).
+    /// The raw owner pubkey is NOT stored on-chain.
+    pub owner_hash: [u8; 32],
 
     /// The SPL token mint this vault tracks.
     pub token_mint: Pubkey,
@@ -32,16 +37,19 @@ impl ConfidentialVault {
 
     /// Account size in bytes.
     pub const SIZE: usize = 8 + // discriminator
-        32 + // owner
+        32 + // owner_hash
         32 + // token_mint
         16 + // encrypted_balance (Euint128 is u128 = 16 bytes)
         32 + // bridge_authority
         1;   // bump
 
     /// Derive the vault PDA for a given owner and mint.
+    /// Uses keccak256(owner) for privacy — explorer can't reverse to get the owner.
     pub fn derive_pda(owner: &Pubkey, token_mint: &Pubkey, program_id: &Pubkey) -> (Pubkey, u8) {
+        use anchor_lang::solana_program::keccak;
+        let owner_hash = keccak::hash(owner.as_ref());
         Pubkey::find_program_address(
-            &[Self::SEED_PREFIX, owner.as_ref(), token_mint.as_ref()],
+            &[Self::SEED_PREFIX, &owner_hash.0, token_mint.as_ref()],
             program_id,
         )
     }

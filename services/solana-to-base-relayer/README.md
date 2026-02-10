@@ -8,7 +8,7 @@ This service enables the Solana → Base direction of the confidential bridge by
 
 1. **Monitoring** Solana for `ConfidentialBridgeOutEvent` emissions
 2. **Parsing** encrypted amount handles and destination addresses
-3. **Relaying** to Base via `receiveFromSolanaForDemo()` contract call
+3. **Relaying** to Base via `receiveFromSolana()` contract call
 4. **Minting** confidential tokens to users on Base
 
 ## Architecture
@@ -29,10 +29,10 @@ Emit event ───────────────>│    - encrypted hand
                            │    Solana u128 → EVM bytes
                            │    
                            │    Call Base contract
-                           └──> receiveFromSolanaForDemo()
+                           └──> receiveFromSolana()
                                 - localToken
                                 - to (destination)
-                                - encryptedAmount (bytes)
+                                - nonce
                                 
                                 Mint tokens ───────────> User receives
                                                          confidential
@@ -171,8 +171,8 @@ Calls the Base contract to mint tokens:
 await walletClient.writeContract({
     address: CONFIDENTIAL_BRIDGE_ADDRESS,
     abi: BRIDGE_ABI,
-    functionName: "receiveFromSolanaForDemo",
-    args: [tokenAddress, destinationAddress, encryptedAmountHex],
+    functionName: "receiveFromSolana",
+    args: [tokenAddress, destinationAddress, nonce],
     value: incoFee,
 });
 ```
@@ -257,15 +257,15 @@ cast balance $RELAYER_ADDRESS --rpc-url https://sepolia.base.org
 ### "Handle mismatch"
 
 **Cause:** Security check failed (potential attack)  
-**Solution:** This is normal in demo mode, investigate if in production
+**Solution:** Investigate — this may indicate a replay attack or data corruption
 
 ## Security Considerations
 
-### Current Implementation (Demo Mode)
+### Current Implementation
 
-⚠️ **Using `receiveFromSolanaForDemo()`** which has no access control  
+✅ **Using `receiveFromSolana()`** with nonce-based replay protection  
 ⚠️ **No signature verification** from bridge validators  
-⚠️ **Anyone can call** the mint function with valid data  
+⚠️ **Relayer-only access** - relayer address must be authorized  
 
 ### Production Requirements
 
@@ -342,7 +342,7 @@ cast balance $RELAYER_ADDRESS --rpc-url https://sepolia.base.org
 ### Functions Called
 
 **Base Contract:**
-- `receiveFromSolanaForDemo(address localToken, address to, bytes encryptedAmount)` - Mints tokens
+- `receiveFromSolana(address localToken, address to, uint256 nonce)` - Mints tokens with replay protection
 
 ## Development
 

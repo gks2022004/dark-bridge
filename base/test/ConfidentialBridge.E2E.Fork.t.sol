@@ -74,8 +74,9 @@ contract ConfidentialBridgeE2EForkTest is Test {
     );
 
     event ConfidentialBridgeReceived(
+        uint256 indexed nonce,
         address indexed localToken,
-        address indexed to,
+        bytes32 indexed toHash,
         euint256 encryptedAmount
     );
 
@@ -143,7 +144,7 @@ contract ConfidentialBridgeE2EForkTest is Test {
         );
 
         // Deploy Confidential Token Implementation
-        confidentialToken = new ConfidentialCrossChainERC20(address(confidentialBridge));
+        confidentialToken = new ConfidentialCrossChainERC20(address(confidentialBridge), deployer);
 
         // Note: Skipping initialize since implementation has _disableInitializers()
         // For fork testing, we test the contract logic without full initialization
@@ -418,8 +419,9 @@ contract ConfidentialBridgeE2EForkTest is Test {
         vm.prank(DEPLOYED_BRIDGE); // Only bridge can call
         vm.expectEmit(true, true, false, false);
         emit ConfidentialBridgeReceived(
+            0,
             address(confidentialToken),
-            alice,
+            keccak256(abi.encodePacked(alice)),
             euint256.wrap(bytes32(0))
         );
 

@@ -1,24 +1,25 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { useAccount, useChainId, useSwitchChain, useWriteContract, useWaitForTransactionReceipt } from "wagmi";
-import { parseAbi } from "viem";
+import { useAccount, useChainId, useSwitchChain, useWalletClient, useWaitForTransactionReceipt } from "wagmi";
+import { parseAbi, type Hash } from "viem";
 import { baseSepolia } from "wagmi/chains";
-import { CONFIDENTIAL_TOKEN_ADDRESS } from "@/lib/constants";
+import { CONFIDENTIAL_TOKEN_ADDRESS, INCO_PEPPER } from "@/lib/constants";
 import { motion } from "framer-motion";
 import { Droplets, ExternalLink, AlertCircle, CheckCircle, Loader2, Coins } from "lucide-react";
 
 const TOKEN_ABI = parseAbi([
-    "function confidentialMintForDemo(address to, uint256 plainAmount) external payable",
+    "function faucetMint(address to, bytes encryptedAmount) external payable",
 ]);
 
 export function Faucet() {
     const { address, isConnected, isConnecting } = useAccount();
     const chainId = useChainId();
     const { switchChain } = useSwitchChain();
+    const { data: walletClient } = useWalletClient();
 
-    // Use wagmi's useWriteContract hook instead of walletClient
-    const { writeContract, data: hash, isPending, error: writeError, reset } = useWriteContract();
+    const [hash, setHash] = useState<Hash | undefined>();
+    const [isPending, setIsPending] = useState(false);
     const { isLoading: isConfirming, isSuccess } = useWaitForTransactionReceipt({ hash });
 
     const [error, setError] = useState<string | null>(null);
@@ -28,27 +29,6 @@ export function Faucet() {
     useEffect(() => {
         setMounted(true);
     }, []);
-
-    // Handle write errors
-    useEffect(() => {
-        if (writeError) {
-            const err = writeError as Error & { cause?: unknown; shortMessage?: string };
-            console.error("Faucet writeError:", err);
-            console.error("Full message:", err.message);
-            console.error("Cause:", err.cause);
-
-            let errorMsg = "Transaction failed";
-            if (err.message?.includes("user rejected") || err.message?.includes("User rejected")) {
-                errorMsg = "Transaction rejected by user";
-            } else if (err.shortMessage) {
-                errorMsg = err.shortMessage;
-            } else if (err.message) {
-                // Show more of the error for debugging
-                errorMsg = err.message.slice(0, 300);
-            }
-            setError(errorMsg);
-        }
-    }, [writeError]);
 
     // Check if on correct chain
     const isWrongChain = isConnected && chainId !== baseSepolia.id;
@@ -70,33 +50,66 @@ export function Faucet() {
         }
     };
 
-    const handleMint = () => {
-        if (!address) {
+    const handleMint = async () => {
+        if (!address || !walletClient) {
             setError("Wallet not ready. Please try again.");
             return;
         }
 
         setError(null);
-        reset(); // Reset any previous errors
+        setHash(undefined);
+        setIsPending(true);
 
-        // Inco fee for encryption (0.001 ETH should cover it)
-        const incoFee = BigInt("1000000000000000"); // 0.001 ETH
+        try {
+            // Mint 100 tokens (with 18 decimals)
+            const mintAmount = BigInt(100) * BigInt(10 ** 18);
 
-        // Mint 100 tokens (with 18 decimals)
-        const mintAmount = BigInt(100) * BigInt(10 ** 18);
+            console.log("Minting to:", address);
+            console.log("Token contract:", CONFIDENTIAL_TOKEN_ADDRESS);
+            console.log("Amount:", mintAmount.toString());
 
-        console.log("Minting to:", address);
-        console.log("Token contract:", CONFIDENTIAL_TOKEN_ADDRESS);
-        console.log("Amount:", mintAmount.toString());
+            // Client-side encrypt the amount using Inco zap
+            const { Lightning } = await import("@inco/js/lite");
+            const { handleTypes, supportedChains } = await import("@inco/js");
+            const zap = await Lightning.latest(INCO_PEPPER, supportedChains.baseSepolia);
 
-        writeContract({
-            address: CONFIDENTIAL_TOKEN_ADDRESS as `0x${string}`,
-            abi: TOKEN_ABI,
-            functionName: "confidentialMintForDemo",
-            args: [address, mintAmount],
-            value: incoFee,
-            chainId: baseSepolia.id, // Force Base Sepolia
-        });
+            console.log("Encrypting amount with Inco...");
+            const ciphertext = await zap.encrypt(mintAmount, {
+                accountAddress: address,
+                dappAddress: CONFIDENTIAL_TOKEN_ADDRESS as `0x${string}`,
+                handleType: handleTypes.euint256,
+            });
+
+            console.log("Ciphertext ready, sending transaction...");
+
+            // Inco fee for encryption (0.001 ETH)
+            const incoFee = BigInt("1000000000000000");
+
+            const txHash = await walletClient.writeContract({
+                address: CONFIDENTIAL_TOKEN_ADDRESS as `0x${string}`,
+                abi: TOKEN_ABI,
+                functionName: "faucetMint",
+                args: [address, ciphertext],
+                value: incoFee,
+                chain: baseSepolia,
+            });
+
+            setHash(txHash);
+        } catch (err: unknown) {
+            console.error("Faucet error:", err);
+            let errorMsg = "Transaction failed";
+            const e = err as { message?: string; shortMessage?: string };
+            if (e.message?.includes("user rejected") || e.message?.includes("User rejected")) {
+                errorMsg = "Transaction rejected by user";
+            } else if (e.shortMessage) {
+                errorMsg = e.shortMessage;
+            } else if (e.message) {
+                errorMsg = e.message.slice(0, 300);
+            }
+            setError(errorMsg);
+        } finally {
+            setIsPending(false);
+        }
     };
 
     // SSR fallback

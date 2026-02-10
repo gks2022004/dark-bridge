@@ -7,18 +7,18 @@ import {ConfidentialBridge} from "../src/ConfidentialBridge.sol";
 
 /// @title SetupConfidentialToken
 /// @notice Creates and registers cDARK token with an existing ConfidentialBridge.
-/// @dev Uses the already-deployed ConfidentialBridge with e.reveal() support.
+/// @dev Uses the already-deployed ConfidentialBridge with e.allow() support.
 /// 
 /// Usage:
 ///   PRIVATE_KEY=0x... forge script script/SetupConfidentialToken.s.sol \
 ///     --rpc-url base-sepolia --broadcast --verify
 contract SetupConfidentialToken is Script {
-    // The new ConfidentialBridge (with plaintext event support)
-    address constant CONFIDENTIAL_BRIDGE = 0xD705858A979a4ab42e7a2e43e8CcC726Dbd87369;
+    // The ConfidentialBridge (with e.allow() for relayer-only decrypt)
+    address constant CONFIDENTIAL_BRIDGE = 0x04423E2D4e74b8C5D17730143400ca43fC800f73;
     
     // Solana token mint for cDARK (in bytes32 format)
-    // 2wcB7tJ56xTa68zMstHhMBYymeCaBvG3Vp2xW9JMVNrH in base58
-    bytes32 constant SOLANA_TOKEN_MINT = 0x1cd8d28fb7697151a7202ba6f1aee1df7b201b5bce634fe0d48e0aadc8435fde;
+    // 3JWs353tgpFRVxb6Ubi85hDm5eBsbGrJFmVqNS8t6V3V in base58
+    bytes32 constant SOLANA_TOKEN_MINT = 0x223403719246903aaf8dc5029034932739e7641a28e51c89c199ab62e27d5598;
 
     function run() external {
         uint256 deployerPrivateKey = vm.envUint("PRIVATE_KEY");
@@ -36,7 +36,8 @@ contract SetupConfidentialToken is Script {
         // 1. Deploy cDARK token (ConfidentialCrossChainERC20)
         console2.log("1. Deploying cDARK token...");
         ConfidentialCrossChainERC20 cDark = new ConfidentialCrossChainERC20(
-            CONFIDENTIAL_BRIDGE
+            CONFIDENTIAL_BRIDGE,
+            deployer // authorized minter (relayer)
         );
         console2.log("   cDARK token:", address(cDark));
 

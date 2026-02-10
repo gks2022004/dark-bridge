@@ -592,22 +592,6 @@ pub mod bridge {
     /// Bridge tokens confidentially from Solana to Base.
     /// Burns encrypted tokens from vault and emits bridge message.
     ///
-    /// Bridge tokens confidentially from Solana to Base (plaintext amount).
-    /// This version accepts plaintext amount and uses trivial encryption on-chain.
-    /// Easier to call from clients that don't have access to Inco encryption SDK.
-    ///
-    /// # Arguments
-    /// * `ctx` - The context containing vault and bridge accounts
-    /// * `plaintext_amount` - Plaintext amount as u128
-    /// * `destination_evm` - 20-byte Ethereum address on Base
-    pub fn bridge_confidential_out_plaintext<'a, 'info>(
-        ctx: Context<'a, '_, '_, 'info, BridgeConfidentialOut<'info>>,
-        plaintext_amount: u128,
-        destination_evm: [u8; 20],
-    ) -> Result<()> {
-        confidential::bridge_confidential_out_plaintext(ctx, plaintext_amount, destination_evm)
-    }
-
     /// Bridge tokens confidentially from Solana to Base (ciphertext).
     /// This version expects client-side encrypted ciphertext from Inco SDK.
     ///
@@ -719,12 +703,14 @@ pub mod bridge {
     /// * `ctx` - The context containing vault and token accounts
     /// * `plaintext_amount` - The decrypted amount from attestation
     /// * `expected_handle` - The encrypted handle that was decrypted
+    /// * `attestation_signature` - Guardian's Ed25519 attestation signature
     pub fn withdraw_with_attestation<'info>(
         ctx: Context<'_, '_, '_, 'info, WithdrawWithAttestation<'info>>,
         plaintext_amount: u64,
         expected_handle: u128,
+        attestation_signature: [u8; 64],
     ) -> Result<()> {
-        confidential::withdraw_with_attestation(ctx, plaintext_amount, expected_handle)
+        confidential::withdraw_with_attestation(ctx, plaintext_amount, expected_handle, attestation_signature)
     }
 
     // ============================================================================

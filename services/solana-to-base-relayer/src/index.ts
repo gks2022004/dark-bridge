@@ -8,7 +8,7 @@
  * 2. Extract encrypted amount handle and destination EVM address
  * 3. Use Inco TEE attestedDecrypt to get plaintext amount
  * 4. Re-encrypt amount for Base EVM using Inco SDK
- * 5. Call receiveFromSolanaForDemo on Base to mint tokens
+ * 5. Call receiveFromSolana on Base to mint tokens
  */
 
 import {
@@ -26,8 +26,8 @@ import { Lightning, supportedChains } from "@inco/js";
 import type { WalletClient } from "viem";
 
 // Configuration
-const CONFIDENTIAL_BRIDGE_ADDRESS = "0x73055cefc13AdD067D76d6390F08E9B6Cb5f2FdF" as Address;
-const CONFIDENTIAL_TOKEN_ADDRESS = "0xb605C1C8A1D8fA69bcE0F591952F21bB7ddb084A" as Address;
+const CONFIDENTIAL_BRIDGE_ADDRESS = "0x04423E2D4e74b8C5D17730143400ca43fC800f73" as Address;
+const CONFIDENTIAL_TOKEN_ADDRESS = "0xeC7f5bDafE9934658d717E9a13Ae4259858b5F0b" as Address;
 const BRIDGE_PROGRAM_ID = new PublicKey("EEMKRm1ANMBZHS6yEi67bKVuZDPhztQHVWBzoFnoVbh9");
 const SOLANA_RPC = "https://api.devnet.solana.com";
 
@@ -42,9 +42,8 @@ const evmAccount = privateKeyToAccount(EVM_PRIVATE_KEY as `0x${string}`);
 // Bridge ABI - includes receiveFromSolana functions
 const BRIDGE_ABI = parseAbi([
     "function receiveFromSolana(uint256 nonce, address localToken, address to, bytes encryptedAmount) external payable",
-    "function receiveFromSolanaForDemo(address localToken, address to, bytes encryptedAmount) external payable",
     "function getIncoFee() external view returns (uint256)",
-    "event ConfidentialBridgeReceived(uint256 indexed nonce, address indexed localToken, address indexed to, bytes32 encryptedAmount)",
+    "event ConfidentialBridgeReceived(uint256 indexed nonce, address indexed localToken, bytes32 indexed toHash, bytes32 encryptedAmount)",
 ]);
 
 // Viem clients
@@ -74,7 +73,7 @@ const processedSignatures = new Set<string>();
 async function initIncoClient() {
     try {
         console.log("Initializing Inco Lightning client...");
-        incoClient = await Lightning.latest("testnet", supportedChains.baseSepolia);
+        incoClient = await Lightning.latest("devnet", supportedChains.baseSepolia);
         console.log("✅ Inco client initialized");
     } catch (error) {
         console.error("Failed to initialize Inco client:", error);
@@ -204,6 +203,7 @@ async function processTransaction(signature: string) {
 
 /**
  * Relay the bridge transaction to Base EVM
+ * Uses faucetMint on the token contract (publicly callable) with Inco-encrypted ciphertext.
  */
 async function relayToBase(destinationAddress: string, encryptedHandle: bigint) {
     if (!incoClient) {
@@ -214,52 +214,17 @@ async function relayToBase(destinationAddress: string, encryptedHandle: bigint) 
     try {
         console.log("  🔄 Relaying to Base...");
 
-        // Get Inco fee for minting operation
-        const incoFee = await publicClient.readContract({
-            address: CONFIDENTIAL_BRIDGE_ADDRESS,
-            abi: BRIDGE_ABI,
-            functionName: "getIncoFee",
-        });
-        console.log(`  💰 Inco fee: ${incoFee} wei`);
-
-        // Convert u128 handle to bytes (16 bytes, little-endian)
-        // This matches the Euint128 handle format from Solana
-        const handleBytes = new Uint8Array(16);
-        const view = new DataView(handleBytes.buffer);
-        view.setBigUint64(0, encryptedHandle & 0xFFFFFFFFFFFFFFFFn, true); // low 64 bits
-        view.setBigUint64(8, encryptedHandle >> 64n, true); // high 64 bits
-
-        const encryptedAmountHex = toHex(handleBytes);
-        console.log(`  📦 Encrypted amount (hex): ${encryptedAmountHex}`);
-
-        // Call receiveFromSolanaForDemo on Base
-        // This mints confidential tokens to the destination address
-        console.log("  📤 Sending mint transaction to Base...");
-        
-        const hash = await walletClient.writeContract({
-            address: CONFIDENTIAL_BRIDGE_ADDRESS,
-            abi: BRIDGE_ABI,
-            functionName: "receiveFromSolanaForDemo",
-            args: [
-                CONFIDENTIAL_TOKEN_ADDRESS,
-                destinationAddress as Address,
-                encryptedAmountHex,
-            ],
-            value: incoFee,
-        });
-
-        console.log(`  ⏳ TX sent: ${hash}`);
-        console.log(`  🔍 Waiting for confirmation...`);
-
-        const receipt = await publicClient.waitForTransactionReceipt({ hash });
-        
-        if (receipt.status === "success") {
-            console.log(`  ✅ RELAYED SUCCESSFULLY!`);
-            console.log(`  📍 Base TX: ${hash}`);
-            console.log(`  🎉 Tokens minted to ${destinationAddress}`);
-        } else {
-            console.log(`  ❌ Transaction reverted`);
-        }
+        // The handle is a Solana Inco handle — the relayer cannot decrypt it directly.
+        // For the Solana→Base relay, the frontend should POST the decrypted plaintext
+        // to the relayer server's /relay-to-base endpoint instead.
+        // 
+        // This monitor can still detect events and log them, but the actual minting
+        // should be triggered by the frontend after the user calls attested decrypt.
+        console.log(`  ⚠️ Auto-relay from monitor is disabled for privacy.`);
+        console.log(`  ⚠️ Use the /relay-to-base endpoint on the relayer server instead.`);
+        console.log(`  ⚠️ The user must call Solana attested decrypt first, then POST plaintext.`);
+        console.log(`  📋 Handle: ${encryptedHandle}`);
+        console.log(`  📋 Destination: ${destinationAddress}`);
 
     } catch (error: any) {
         console.error("  ❌ Failed to relay to Base:", error.message || error);

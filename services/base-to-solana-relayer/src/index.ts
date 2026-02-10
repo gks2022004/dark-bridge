@@ -95,8 +95,8 @@ async function processEvent(log: Log) {
             console.log(`  Status: PENDING - Would mint tokens on Solana`);
 
             // TODO: Call Solana program to mint tokens
-            // This requires decrypting the amount first via Inco TEE
-            // Then calling the bridge program on Solana with the plaintext amount
+            // This requires decrypting the amount via Inco TEE attestedDecrypt (relayer has e.allow() access)
+            // Then re-encrypting for Solana TEE and calling the bridge program
 
         } catch (e) {
             console.error(`  Error parsing destination:`, e);

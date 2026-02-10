@@ -1,11 +1,11 @@
 {
   "mockErc20": "0xcb5a0ad14bcd6b623b614cbcad21f7bdd9990d32",
-  "cDarkToken": "0x06eb490068dFdc3b071A89381e06032B9E657906",
-  "confidentialBridge": "0x6f7c0515daF8459c0eBf35DB0411fC665fEf838a",
+  "cDarkToken": "0xeC7f5bDafE9934658d717E9a13Ae4259858b5F0b",
+  "confidentialBridge": "0x04423E2D4e74b8C5D17730143400ca43fC800f73",
   "bridgeRelayer": "0xF8AF04bF0Ac151f2050436603d81Ba20f449028F",
-  "solanaTokenMint": "2wcB7tJ56xTa68zMstHhMBYymeCaBvG3Vp2xW9JMVNrH",
-  "solanaTokenMintBytes32": "0x1cd8d28fb7697151a7202ba6f1aee1df7b201b5bce634fe0d48e0aadc8435fde",
-  "deployedAt": "2026-01-20",
+  "solanaTokenMint": "3JWs353tgpFRVxb6Ubi85hDm5eBsbGrJFmVqNS8t6V3V",
+  "solanaTokenMintBytes32": "0x223403719246903aaf8dc5029034932739e7641a28e51c89c199ab62e27d5598",
+  "deployedAt": "2026-02-11",
   "deployer": "0xF8AF04bF0Ac151f2050436603d81Ba20f449028F",
-  "note": "Production deployment with e.allow() for bridgeRelayer - proper cross-chain re-encryption"
+  "note": "Redeployment with privacy-fixed events (toSolanaHash + toHash)"
 }

@@ -182,6 +182,15 @@ export function encodeAttestationForSolana(
 /**
  * Derive the vault PDA for a user.
  */
+/**
+ * Hash owner pubkey with keccak256 for privacy-preserving PDA derivation.
+ * Matches Rust: anchor_lang::solana_program::keccak::hash(owner.as_ref())
+ */
+export function hashOwner(owner: PublicKey): Buffer {
+    const hashHex = keccak256(new Uint8Array(owner.toBuffer()));
+    return Buffer.from(hashHex.slice(2), 'hex');
+}
+
 export function deriveVaultPda(
     owner: PublicKey,
     tokenMint: PublicKey,
@@ -190,7 +199,7 @@ export function deriveVaultPda(
     return PublicKey.findProgramAddressSync(
         [
             Buffer.from('confidential_vault'),
-            owner.toBuffer(),
+            hashOwner(owner),
             tokenMint.toBuffer(),
         ],
         bridgeProgramId

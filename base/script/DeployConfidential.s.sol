@@ -35,7 +35,8 @@ contract DeployConfidential is Script {
         // Deploy Confidential Token Implementation with the ConfidentialBridge as its bridge
         // This allows ConfidentialBridge to call confidentialBurnFromHandle
         ConfidentialCrossChainERC20 tokenImpl = new ConfidentialCrossChainERC20(
-            address(confidentialBridge)
+            address(confidentialBridge),
+            deployer // authorized minter (relayer)
         );
         console2.log("ConfidentialCrossChainERC20 impl:", address(tokenImpl));
 

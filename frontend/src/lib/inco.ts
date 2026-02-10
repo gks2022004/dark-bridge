@@ -7,14 +7,10 @@ import { CONFIDENTIAL_BRIDGE_ADDRESS, INCO_PEPPER, BASE_CHAIN_ID } from "./const
 // Relayer server URL
 const RELAYER_URL = process.env.NEXT_PUBLIC_RELAYER_URL || "http://localhost:3001";
 
-let zapInstance: Awaited<ReturnType<typeof Lightning.latest>> | null = null;
-
 export async function getZap() {
-    if (!zapInstance) {
-        // Initialize with devnet pepper to match contract's Lib.sol
-        zapInstance = await Lightning.latest(INCO_PEPPER, BASE_CHAIN_ID);
-    }
-    return zapInstance;
+    // Create fresh instance each time to avoid stale state issues
+    // with @inco/js@0.8.0-devnet-3
+    return await Lightning.latest(INCO_PEPPER, BASE_CHAIN_ID);
 }
 
 export async function encryptAmount(
@@ -75,25 +71,6 @@ export async function attestedDecrypt(
         value: r.plaintext.value as bigint,
         // Convert signatures to the format expected by the contract
         signatures: r.covalidatorSignatures as unknown as string[],
-    }));
-}
-
-/**
- * Attested reveal for handles marked with e.reveal() in the contract.
- * This does NOT require user's wallet signature - works for public reveals.
- * Used by the relayer for cross-chain bridge transfers.
- */
-export async function attestedReveal(
-    handles: string[]
-): Promise<{ value: bigint }[]> {
-    const zap = await getZap();
-
-    const results = await zap.attestedReveal(handles as `0x${string}`[]);
-
-    return results.map((r) => ({
-        value: (r.plaintext as any).value !== undefined 
-            ? BigInt((r.plaintext as any).value) 
-            : BigInt(r.plaintext as any),
     }));
 }
 

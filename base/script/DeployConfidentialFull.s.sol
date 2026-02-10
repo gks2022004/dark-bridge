@@ -8,25 +8,25 @@ import {ConfidentialBridge} from "../src/ConfidentialBridge.sol";
 /// @title DeployConfidentialFull
 /// @notice Full deployment script for confidential bridge with proper setup.
 /// @dev Deploys ConfidentialBridge, cDARK token, initializes, and registers.
-/// @dev Uses e.reveal() in bridgePrivateToSolana so attestedReveal works without user signature.
+/// @dev Uses e.allow() in bridgePrivateToSolana so relayer can attestedDecrypt with its wallet.
 /// 
 /// Usage:
 ///   PRIVATE_KEY=0x... forge script script/DeployConfidentialFull.s.sol \
 ///     --rpc-url base-sepolia --broadcast --verify
 contract DeployConfidentialFull is Script {
     // Existing infrastructure on Base Sepolia
-    address constant EXISTING_BRIDGE = 0x5CF8A12B48a221aCeD811602d0F0752CBe110fBe;
-    address constant FACTORY = 0xEeEBDDa1bfE1C0aF25A56A3beb73e495dbaE7DEB;
+    address constant EXISTING_BRIDGE = 0x8E46419298a9620eA326113baf4019A23594BB11;
+    address constant FACTORY = 0xD40931BEa89fe4c1589c251dCD138f856bCAE750;
     
     // Solana token mint for cDARK (in bytes32 format)
-    // 2wcB7tJ56xTa68zMstHhMBYymeCaBvG3Vp2xW9JMVNrH in base58
-    bytes32 constant SOLANA_TOKEN_MINT = 0x1cd8d28fb7697151a7202ba6f1aee1df7b201b5bce634fe0d48e0aadc8435fde;
+    // 3JWs353tgpFRVxb6Ubi85hDm5eBsbGrJFmVqNS8t6V3V in base58
+    bytes32 constant SOLANA_TOKEN_MINT = 0x223403719246903aaf8dc5029034932739e7641a28e51c89c199ab62e27d5598;
 
     function run() external {
         uint256 deployerPrivateKey = vm.envUint("PRIVATE_KEY");
         address deployer = vm.addr(deployerPrivateKey);
 
-        console2.log("=== Deploying Confidential Bridge (Full Setup with e.reveal) ===");
+        console2.log("=== Deploying Confidential Bridge (Full Setup with e.allow) ===");
         console2.log("Deployer:", deployer);
         console2.log("");
 
@@ -44,7 +44,8 @@ contract DeployConfidentialFull is Script {
         // 2. Deploy cDARK token (ConfidentialCrossChainERC20)
         console2.log("2. Deploying cDARK token...");
         ConfidentialCrossChainERC20 cDark = new ConfidentialCrossChainERC20(
-            address(confidentialBridge)
+            address(confidentialBridge),
+            deployer // authorized minter (relayer)
         );
         console2.log("   cDARK token:", address(cDark));
 
@@ -66,8 +67,10 @@ contract DeployConfidentialFull is Script {
         );
         console2.log("   Token registered");
 
-        // NOTE: No bridgeRelayer needed! The contract now uses e.reveal() 
-        // so the relayer can use attestedReveal() without user signature.
+        // 5. Set bridge relayer (deployer is also the relayer for this hackathon)
+        console2.log("5. Setting bridge relayer...");
+        confidentialBridge.setBridgeRelayer(deployer);
+        console2.log("   Bridge relayer set to:", deployer);
 
         vm.stopBroadcast();
 
@@ -79,8 +82,8 @@ contract DeployConfidentialFull is Script {
         console2.log("");
         console2.log("=== How It Works ===");
         console2.log("1. User calls bridgePrivateToSolana() with encrypted amount");
-        console2.log("2. Contract burns tokens and calls e.reveal(amount)");
-        console2.log("3. Relayer uses attestedReveal() - no user signature needed");
+        console2.log("2. Contract burns tokens and calls e.allow(amount, bridgeRelayer)");
+        console2.log("3. Relayer uses attestedDecrypt() with its own wallet signature");
         console2.log("4. Relayer re-encrypts for Solana TEE and relays");
         console2.log("");
         console2.log("=== Next Steps ===");

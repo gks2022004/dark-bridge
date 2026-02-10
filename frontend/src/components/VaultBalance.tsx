@@ -5,6 +5,7 @@ import { PublicKey, SystemProgram, Transaction, TransactionInstruction } from "@
 import { useWallet, useConnection } from "@solana/wallet-adapter-react";
 import { BRIDGE_PROGRAM_ID, SOLANA_CDARK_TOKEN_MINT, INCO_LIGHTNING_PROGRAM_ID } from "@/lib/constants";
 import { decrypt } from "@inco/solana-sdk/attested-decrypt";
+import { keccak256 } from "viem";
 import { motion, AnimatePresence } from "framer-motion";
 import { Wallet, RefreshCw, Lock, Eye, ExternalLink, Loader2, AlertCircle, CheckCircle } from "lucide-react";
 
@@ -23,10 +24,11 @@ function readU128LE(buffer: Uint8Array): bigint {
 }
 
 function deriveVaultPda(owner: PublicKey, tokenMint: PublicKey): [PublicKey, number] {
+    const ownerHash = Buffer.from(keccak256(new Uint8Array(owner.toBuffer())).slice(2), "hex");
     return PublicKey.findProgramAddressSync(
         [
             Buffer.from(VAULT_SEED_PREFIX),
-            owner.toBuffer(),
+            ownerHash,
             tokenMint.toBuffer(),
         ],
         new PublicKey(BRIDGE_PROGRAM_ID)
@@ -34,7 +36,7 @@ function deriveVaultPda(owner: PublicKey, tokenMint: PublicKey): [PublicKey, num
 }
 
 interface VaultData {
-    owner: string;
+    ownerHash: string;
     tokenMint: string;
     bridgeAuthority: string;
     encryptedBalanceHandle: bigint;
@@ -105,7 +107,7 @@ export function VaultBalance() {
 
                 if (accountInfo) {
                     const data = accountInfo.data;
-                    // Correct offset: discriminator (8) + owner (32) + token_mint (32) = 72
+                    // Correct offset: discriminator (8) + owner_hash (32) + token_mint (32) = 72
                     const encryptedBalance = data.subarray(8 + 32 + 32, 8 + 32 + 32 + 16);
                     const newHandle = readU128LE(encryptedBalance).toString();
 
@@ -148,10 +150,10 @@ export function VaultBalance() {
             setVaultExists(true);
 
             // Parse vault data
-            // Structure: discriminator (8) + owner (32) + token_mint (32) + encrypted_balance (16) + bridge_authority (32) + bump (1)
+            // Structure: discriminator (8) + owner_hash (32) + token_mint (32) + encrypted_balance (16) + bridge_authority (32) + bump (1)
             const data = accountInfo.data;
 
-            const ownerBytes = data.subarray(8, 8 + 32);
+            const ownerHashBytes = data.subarray(8, 8 + 32);
             const tokenMintBytes = data.subarray(8 + 32, 8 + 32 + 32);
             const encryptedBalance = data.subarray(8 + 32 + 32, 8 + 32 + 32 + 16);
             const bridgeAuthorityBytes = data.subarray(8 + 32 + 32 + 16, 8 + 32 + 32 + 16 + 32);
@@ -161,7 +163,7 @@ export function VaultBalance() {
             console.log("Parsed vault - handle:", readU128LE(encryptedBalance).toString());
 
             setVaultData({
-                owner: new PublicKey(ownerBytes).toBase58(),
+                ownerHash: Buffer.from(ownerHashBytes).toString('hex'),
                 tokenMint: new PublicKey(tokenMintBytes).toBase58(),
                 bridgeAuthority: new PublicKey(bridgeAuthorityBytes).toBase58(),
                 encryptedBalanceHandle: readU128LE(encryptedBalance),

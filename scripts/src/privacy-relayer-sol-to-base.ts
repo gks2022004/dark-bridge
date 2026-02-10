@@ -61,8 +61,8 @@ if (!EVM_PRIVATE_KEY) {
 const evmAccount = privateKeyToAccount(EVM_PRIVATE_KEY as `0x${string}`);
 
 // Deployed addresses (from base/deployments/base_sepolia.json and .cdark-deployment.json)
-const CONFIDENTIAL_BRIDGE_ADDRESS = "0xD705858A979a4ab42e7a2e43e8CcC726Dbd87369" as Address;
-const CONFIDENTIAL_TOKEN_ADDRESS = "0xFBAD5A940d89e504C5f8C9e0fC3A976A82334565" as Address;
+const CONFIDENTIAL_BRIDGE_ADDRESS = "0x04423E2D4e74b8C5D17730143400ca43fC800f73" as Address;
+const CONFIDENTIAL_TOKEN_ADDRESS = "0xeC7f5bDafE9934658d717E9a13Ae4259858b5F0b" as Address;
 
 // Bridge Program ID
 const BRIDGE_PROGRAM_ID = new PublicKey("EEMKRm1ANMBZHS6yEi67bKVuZDPhztQHVWBzoFnoVbh9");
@@ -113,15 +113,13 @@ const baseWalletClient = createWalletClient({
 
 // --- ABIs ---
 const CONFIDENTIAL_BRIDGE_ABI = parseAbi([
-    "function receiveFromSolanaForDemo(address localToken, address to, bytes encryptedAmount) external payable",
     "function receiveFromSolanaLegacy(address localToken, address to, bytes encryptedAmount) external payable",
     "function getIncoFee() external view returns (uint256)",
-    "event ConfidentialBridgeReceived(uint256 indexed nonce, address indexed localToken, address indexed to, bytes32 encryptedAmount)",
+    "event ConfidentialBridgeReceived(uint256 indexed nonce, address indexed localToken, bytes32 indexed toHash, bytes32 encryptedAmount)",
 ]);
 
 const CONFIDENTIAL_TOKEN_ABI = parseAbi([
-    "function confidentialMint(address to, bytes encryptedAmount) external payable",
-    "function confidentialMintForDemo(address to, uint256 plainAmount) external payable",
+    "function faucetMint(address to, bytes encryptedAmount) external payable",
 ]);
 
 console.log("=== Privacy Relayer (Solana → Base) ===");
@@ -132,79 +130,16 @@ console.log(`Confidential Token: ${CONFIDENTIAL_TOKEN_ADDRESS}`);
 // --- Event Parsing ---
 interface ConfidentialBridgeOutEvent {
     vault: string;
-    owner: string;
+    ownerHash: string; // keccak256 hash hex (not a raw pubkey)
     destinationEvm: Uint8Array;
     encryptedAmountHandle: bigint;
 }
 
-/**
- * Parse ConfidentialBridgeOutPlaintextEvent from Solana transaction logs.
- * This version includes the plaintext amount for cross-chain relay.
+/**\n * Parse ConfidentialBridgeOutEvent from Solana transaction logs.
  * 
  * Event structure (from instructions.rs):
  * - vault: Pubkey
- * - owner: Pubkey
- * - destination_evm: [u8; 20]
- * - encrypted_amount_handle: u128
- * - plaintext_amount: u128
- */
-function parseConfidentialBridgeOutPlaintextEvent(logs: string[]): ConfidentialBridgeOutEvent & { plaintextAmount: bigint } | null {
-    // Compute discriminator for ConfidentialBridgeOutPlaintextEvent
-    const EXPECTED_DISCRIMINATOR = Buffer.from(computeAnchorEventDiscriminator("ConfidentialBridgeOutPlaintextEvent"));
-
-    for (const log of logs) {
-        if (log.startsWith("Program data:")) {
-            try {
-                const base64Data = log.replace("Program data: ", "");
-                const data = Buffer.from(base64Data, "base64");
-
-                const discriminator = data.subarray(0, 8);
-                if (!discriminator.equals(EXPECTED_DISCRIMINATOR)) {
-                    continue;
-                }
-
-                // Event: vault (32) + owner (32) + destination_evm (20) + encrypted_amount_handle (16) + plaintext_amount (16)
-                if (data.length >= 8 + 32 + 32 + 20 + 16 + 16) {
-                    let offset = 8;
-
-                    const vault = new PublicKey(data.subarray(offset, offset + 32)).toBase58();
-                    offset += 32;
-
-                    const owner = new PublicKey(data.subarray(offset, offset + 32)).toBase58();
-                    offset += 32;
-
-                    const destinationEvm = data.subarray(offset, offset + 20);
-                    offset += 20;
-
-                    const handleBytes = data.subarray(offset, offset + 16);
-                    const encryptedAmountHandle = readU128LE(handleBytes);
-                    offset += 16;
-
-                    const plaintextBytes = data.subarray(offset, offset + 16);
-                    const plaintextAmount = readU128LE(plaintextBytes);
-
-                    return {
-                        vault,
-                        owner,
-                        destinationEvm,
-                        encryptedAmountHandle,
-                        plaintextAmount,
-                    };
-                }
-            } catch (e) {
-                // Not the event we're looking for
-            }
-        }
-    }
-    return null;
-}
-
-/**
- * Parse ConfidentialBridgeOutEvent from Solana transaction logs.
- * 
- * Event structure (from instructions.rs):
- * - vault: Pubkey
- * - owner: Pubkey
+ * - owner_hash: [u8; 32] (keccak256 of owner pubkey)
  * - destination_evm: [u8; 20]
  * - encrypted_amount_handle: u128
  */
@@ -237,8 +172,8 @@ function parseConfidentialBridgeOutEvent(logs: string[]): ConfidentialBridgeOutE
                     const vault = new PublicKey(data.subarray(offset, offset + 32)).toBase58();
                     offset += 32;
 
-                    // owner: Pubkey (32 bytes)
-                    const owner = new PublicKey(data.subarray(offset, offset + 32)).toBase58();
+                    // owner_hash: [u8; 32] (keccak256 hash, NOT a pubkey)
+                    const ownerHash = Buffer.from(data.subarray(offset, offset + 32)).toString('hex');
                     offset += 32;
 
                     // destination_evm: [u8; 20]
@@ -251,7 +186,7 @@ function parseConfidentialBridgeOutEvent(logs: string[]): ConfidentialBridgeOutE
 
                     return {
                         vault,
-                        owner,
+                        ownerHash,
                         destinationEvm,
                         encryptedAmountHandle,
                     };
@@ -579,8 +514,10 @@ async function decryptWithOfficialSDK(handle: bigint): Promise<bigint | null> {
 
 /**
  * Relay a confidential bridge message from Solana to Base.
+ * @param txSignature - The Solana TX signature containing the bridge event
+ * @param plaintextAmountWei - Optional pre-decrypted amount (from user's attested decrypt)
  */
-async function relayConfidentialToBase(txSignature: string): Promise<boolean> {
+async function relayConfidentialToBase(txSignature: string, plaintextAmountWei?: bigint): Promise<boolean> {
     console.log(`\n=== Processing Solana TX: ${txSignature} ===`);
 
     try {
@@ -600,41 +537,25 @@ async function relayConfidentialToBase(txSignature: string): Promise<boolean> {
         const logs = tx.meta?.logMessages || [];
         console.log(`   Found ${logs.length} log messages`);
 
-        // 2. Parse events - try plaintext version first (has actual amount!)
-        const plaintextEvent = parseConfidentialBridgeOutPlaintextEvent(logs);
-        const regularEvent = !plaintextEvent ? parseConfidentialBridgeOutEvent(logs) : null;
-        const privateEvent = !plaintextEvent && !regularEvent ? parseRelayedPrivateBridgeOutEvent(logs) : null;
+        // 2. Parse events - try encrypted event types
+        const regularEvent = parseConfidentialBridgeOutEvent(logs);
+        const privateEvent = !regularEvent ? parseRelayedPrivateBridgeOutEvent(logs) : null;
 
         // Create unified event structure
         let destinationEvm: Uint8Array;
         let encryptedAmountHandle: bigint;
-        let ownerPubkey: PublicKey | null = null;
-        let isSenderPrivate = false;
         let plaintextAmount: bigint | null = null;
 
-        if (plaintextEvent) {
-            console.log(`   ✅ Found ConfidentialBridgeOutPlaintextEvent:`);
-            console.log(`      Vault: ${plaintextEvent.vault}`);
-            console.log(`      Owner: ${plaintextEvent.owner}`);
-            console.log(`      Plaintext Amount: ${plaintextEvent.plaintextAmount} (REAL AMOUNT!)`);
-            destinationEvm = plaintextEvent.destinationEvm;
-            encryptedAmountHandle = plaintextEvent.encryptedAmountHandle;
-            ownerPubkey = new PublicKey(plaintextEvent.owner);
-            plaintextAmount = plaintextEvent.plaintextAmount;
-        } else if (regularEvent) {
+        if (regularEvent) {
             console.log(`   ✅ Found ConfidentialBridgeOutEvent:`);
             console.log(`      Vault: ${regularEvent.vault}`);
-            console.log(`      Owner: ${regularEvent.owner}`);
+            console.log(`      Owner Hash: ${regularEvent.ownerHash}`);
             destinationEvm = regularEvent.destinationEvm;
             encryptedAmountHandle = regularEvent.encryptedAmountHandle;
-            ownerPubkey = new PublicKey(regularEvent.owner);
         } else if (privateEvent) {
             console.log(`   ✅ Found RelayedPrivateBridgeOutEvent: (SENDER HIDDEN!)`);
             destinationEvm = privateEvent.destinationEvm;
             encryptedAmountHandle = privateEvent.encryptedAmountHandle;
-            isSenderPrivate = true;
-            // For private events, we can't grant handle access (no owner)
-            // We'll use demo fallback amount
         } else {
             console.log("   ❌ No bridge event found");
             console.log("   Logs:", logs.slice(0, 10));
@@ -661,60 +582,66 @@ async function relayConfidentialToBase(txSignature: string): Promise<boolean> {
         }
         console.log(`   Inco fee: ${incoFee} wei`);
 
-        // 5. Use plaintext amount if available, otherwise try to decrypt
+        // 5. Decrypt the encrypted handle to get the real amount
         let amountToMint: bigint;
 
-        if (plaintextAmount !== null && plaintextAmount > 0n) {
-            // We have the real plaintext amount from the event!
-            console.log(`   ✅ Using plaintext amount from event: ${plaintextAmount} tokens`);
-            amountToMint = plaintextAmount;
-        } else if (isSenderPrivate) {
-            // Sender-private mode: can't decrypt, use demo fallback
-            console.log(`   🔒 Sender-private event: using demo amount (5 tokens)`);
-            amountToMint = BigInt(5);
+        if (plaintextAmountWei && plaintextAmountWei > 0n) {
+            // Pre-decrypted amount provided (from user's attested decrypt via frontend)
+            console.log(`   ✅ Using pre-decrypted amount: ${plaintextAmountWei} (${Number(plaintextAmountWei) / 1e18} tokens)`);
+            amountToMint = plaintextAmountWei;
         } else {
-            // Try to decrypt the handle - the owner granted access when bridging
-            const isOwner = ownerPubkey ? ownerPubkey.equals(decryptionWallet.publicKey) : false;
-
             try {
                 console.log(`   🔓 Attempting to decrypt handle...`);
 
-                // First try simple decrypt (for handles with public allow)
+                // Try simple decrypt (for handles with public allow or relayer access)
                 const simpleResult = await requestAttestedDecryptSimple(encryptedAmountHandle);
 
                 if (simpleResult !== null && simpleResult.plaintext > 0n) {
                     console.log(`   ✅ Real amount decrypted: ${simpleResult.plaintext} tokens`);
                     amountToMint = simpleResult.plaintext;
-                } else if (isOwner && ownerPubkey) {
-                    // If simple decrypt failed and we are the owner, try the official SDK
-                    console.log(`   📝 Simple decrypt failed, trying with owner signature...`);
-                    await grantHandleAccess(encryptedAmountHandle, ownerPubkey);
+                } else {
+                    // Try with official SDK using the decryption wallet
+                    console.log(`   📝 Simple decrypt failed, trying with SDK...`);
                     const plaintext = await decryptWithOfficialSDK(encryptedAmountHandle);
 
                     if (plaintext !== null && plaintext > 0n) {
                         console.log(`   ✅ Real amount decrypted via SDK: ${plaintext} tokens`);
                         amountToMint = plaintext;
                     } else {
-                        console.log(`   ⚠️ Decrypt returned 0, using demo fallback`);
-                        amountToMint = BigInt(5);
+                        console.error(`   ❌ Cannot decrypt handle. Owner needs to grant relayer access.`);
+                        console.error(`   Skipping this transaction.`);
+                        return false;
                     }
-                } else {
-                    console.log(`   ⚠️ Decrypt not available, using demo fallback`);
-                    amountToMint = BigInt(5);
                 }
             } catch (e: any) {
-                console.log(`   ⚠️ Decrypt failed: ${e.message}`);
-                console.log(`   Using demo fallback amount`);
-                amountToMint = BigInt(5);
+                console.error(`   ❌ Decrypt failed: ${e.message}`);
+                console.error(`   Cannot relay without real amount. Skipping this transaction.`);
+                return false;
             }
         }
 
         console.log(`   Amount to mint: ${amountToMint} tokens`);
         console.log(`   (Original Solana handle: ${encryptedAmountHandle})`);
 
-        // 6. Call confidentialMintForDemo on the token
-        // This encrypts the plaintext on Base using Inco TEE
-        console.log("   Minting on Base via confidentialMintForDemo...");
+        // 6. Re-encrypt the plaintext for EVM using Inco zap.encrypt() and call faucetMint
+        // faucetMint is publicly callable (no access control) and accepts Inco-encrypted ciphertext
+        console.log("   Minting on Base via faucetMint with Inco-encrypted ciphertext...");
+
+        const { Lightning: LightningEvm } = await import("@inco/js/lite");
+        const { supportedChains: evmSupportedChains, handleTypes } = await import("@inco/js");
+        const evmZap = await LightningEvm.latest("devnet", evmSupportedChains.baseSepolia);
+
+        const evmCiphertext = await evmZap.encrypt(amountToMint, {
+            accountAddress: evmAccount.address,
+            dappAddress: CONFIDENTIAL_TOKEN_ADDRESS as `0x${string}`,
+            handleType: handleTypes.euint256,
+        });
+
+        console.log(`   ✅ EVM ciphertext ready (${evmCiphertext.length} bytes)`);
+
+        const FAUCET_MINT_ABI = parseAbi([
+            "function faucetMint(address to, bytes encryptedAmount) external payable",
+        ]);
 
         // Retry with fresh nonce up to 3 times
         let hash: `0x${string}` | null = null;
@@ -731,9 +658,9 @@ async function relayConfidentialToBase(txSignature: string): Promise<boolean> {
 
                 hash = await baseWalletClient.writeContract({
                     address: CONFIDENTIAL_TOKEN_ADDRESS,
-                    abi: CONFIDENTIAL_TOKEN_ABI,
-                    functionName: "confidentialMintForDemo",
-                    args: [destinationAddress, amountToMint],
+                    abi: FAUCET_MINT_ABI,
+                    functionName: "faucetMint",
+                    args: [destinationAddress, evmCiphertext],
                     value: incoFee,
                     nonce: nonce,
                 });
@@ -809,14 +736,10 @@ async function monitorMode() {
 
                         if (tx) {
                             const logs = tx.meta?.logMessages || [];
-                            const plaintextEvent = parseConfidentialBridgeOutPlaintextEvent(logs);
                             const regularEvent = parseConfidentialBridgeOutEvent(logs);
                             const privateEvent = parseRelayedPrivateBridgeOutEvent(logs);
 
-                            if (plaintextEvent) {
-                                console.log("   📦 Confidential bridge event (plaintext) detected!");
-                                await relayConfidentialToBase(sig.signature);
-                            } else if (regularEvent) {
+                            if (regularEvent) {
                                 console.log("   📦 Confidential bridge event detected!");
                                 await relayConfidentialToBase(sig.signature);
                             } else if (privateEvent) {
@@ -874,17 +797,27 @@ To test:
 async function main() {
     const arg = process.argv[2];
 
+    // Parse --amount flag (pre-decrypted plaintext from user's attested decrypt)
+    let plaintextAmountWei: bigint | undefined;
+    const amountFlagIndex = process.argv.indexOf("--amount");
+    if (amountFlagIndex !== -1 && process.argv[amountFlagIndex + 1]) {
+        const amountStr = process.argv[amountFlagIndex + 1]!;
+        plaintextAmountWei = BigInt(amountStr);
+        console.log(`📝 Pre-decrypted amount provided: ${plaintextAmountWei} wei`);
+    }
+
     if (arg === "--monitor") {
         await monitorMode();
     } else if (arg === "--demo") {
         await demoMode();
     } else if (arg && arg.length > 50) {
         // Looks like a Solana transaction signature
-        await relayConfidentialToBase(arg);
+        await relayConfidentialToBase(arg, plaintextAmountWei);
     } else {
         console.log("\nUsage:");
         console.log("  Monitor mode:     bun run src/privacy-relayer-sol-to-base.ts --monitor");
         console.log("  Process TX:       bun run src/privacy-relayer-sol-to-base.ts <SOLANA_TX_SIGNATURE>");
+        console.log("  Process TX (pre-decrypted): bun run src/privacy-relayer-sol-to-base.ts <SOLANA_TX_SIGNATURE> --amount <WEI>");
         console.log("  Demo info:        bun run src/privacy-relayer-sol-to-base.ts --demo");
     }
 }

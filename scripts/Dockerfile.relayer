@@ -18,11 +18,12 @@ RUN bun install --ignore-scripts && bun run build
 WORKDIR /app/scripts
 RUN bun install --ignore-scripts
 
-# Make startup script executable
-RUN chmod +x start-relayers.sh
-
 # Set environment
 ENV NODE_ENV=production
+ENV NODE_TLS_REJECT_UNAUTHORIZED=0
 
-# Run both relayers
-CMD ["./start-relayers.sh"]
+# All secrets and config are passed at runtime via --env-file or -e flags:
+#   docker run --env-file .env -p 3001:3001 privacy-relayer
+
+# Run the unified privacy relayer server
+CMD ["bun", "run", "src/privacy-relayer-server.ts"]

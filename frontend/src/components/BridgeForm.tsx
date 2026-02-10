@@ -7,12 +7,13 @@ import { useWallet, useConnection } from "@solana/wallet-adapter-react";
 import {
     CONFIDENTIAL_BRIDGE_ADDRESS,
     CONFIDENTIAL_TOKEN_ADDRESS,
+    INCO_PEPPER,
 } from "@/lib/constants";
 import {
     checkVaultExists,
     initializeVault,
     getDefaultTokenMint,
-    bridgeConfidentialOut,
+    bridgeConfidentialOutDirect,
     getVaultBalance,
     deriveVaultPda,
 } from "@/lib/solana";
@@ -29,8 +30,8 @@ import {
 // ABI for bridge operations
 const BRIDGE_ABI = parseAbi([
     "function bridgePrivateToSolana(address localToken, bytes32 toSolana, bytes encryptedAmount) external payable",
-    "function bridgePrivateToSolanaPlaintext(address localToken, bytes32 toSolana, uint256 amount) external payable",
     "function getIncoFee() external view returns (uint256)",
+    "function getUserNonce(address user) external view returns (uint256)",
 ]);
 
 // Direction enum
@@ -56,7 +57,7 @@ export function BridgeForm() {
 
     const { data: walletClient } = useWalletClient();
     const publicClient = usePublicClient();
-    const { publicKey: solanaPublicKey, connected: isSolanaConnected, signTransaction } = useWallet();
+    const { publicKey: solanaPublicKey, connected: isSolanaConnected, signTransaction, sendTransaction } = useWallet();
     const { connection } = useConnection();
 
     const [direction, setDirection] = useState<Direction>("base-to-solana");
@@ -284,7 +285,7 @@ export function BridgeForm() {
 
         // Start polling immediately (1 second delay to let relayer start)
         setTimeout(poll, 1000);
-    }, [publicClient, evmAddress, connection, solanaPublicKey, getTokenMint]);
+    }, [publicClient, evmAddress, connection, solanaPublicKey, getTokenMint, RELAYER_API_URL]);
 
     const handleInitializeVault = async () => {
         if (!solanaPublicKey || !signTransaction) {
@@ -406,28 +407,38 @@ export function BridgeForm() {
             console.warn("Could not get initial vault balance (maybe vault not created yet):", e);
         }
 
-        // Step 1: Get Inco fee
-        setStatus("Getting Inco fee...");
-        let incoFee: bigint;
-        try {
-            incoFee = await publicClient.readContract({
-                address: CONFIDENTIAL_BRIDGE_ADDRESS as `0x${string}`,
-                abi: BRIDGE_ABI,
-                functionName: "getIncoFee",
-            });
-        } catch {
-            incoFee = BigInt("100000000000000"); // 0.0001 ETH fallback
-        }
-
-        // Step 2: Parse the plaintext amount
+        // Step 1: Parse amount and encrypt client-side using Inco SDK
         const amountWei = parseUnits(amount, 18);
 
-        // Step 3: Convert Solana pubkey to bytes32
+        setStatus("Encrypting amount...");
+        const { Lightning } = await import("@inco/js/lite");
+        const { supportedChains, handleTypes } = await import("@inco/js");
+        const zap = await Lightning.latest(INCO_PEPPER, supportedChains.baseSepolia);
+
+        // Encrypt the amount client-side — bound to user's address for Inco validation
+        const encryptedAmount = await zap.encrypt(amountWei, {
+            accountAddress: evmAddress,
+            dappAddress: CONFIDENTIAL_BRIDGE_ADDRESS as `0x${string}`,
+            handleType: handleTypes.euint256,
+        });
+
+        // Normalize encrypted amount to hex string
+        let encryptedHex: `0x${string}`;
+        if (typeof encryptedAmount === 'string') {
+            encryptedHex = (encryptedAmount.startsWith('0x')
+                ? encryptedAmount
+                : `0x${encryptedAmount}`) as `0x${string}`;
+        } else if (typeof encryptedAmount === 'object' && encryptedAmount !== null && 'length' in encryptedAmount) {
+            encryptedHex = `0x${Buffer.from(encryptedAmount as Uint8Array).toString('hex')}` as `0x${string}`;
+        } else {
+            encryptedHex = encryptedAmount as `0x${string}`;
+        }
+
+        // Step 2: Convert Solana pubkey to bytes32
         const solanaPubkeyBytes = solanaPublicKey.toBytes();
         const solanaBytes32 = toHex(solanaPubkeyBytes, { size: 32 });
 
         // Capture the latest signature for the vault PDA RIGHT BEFORE sending TX
-        // This minimizes the chance of another transaction arriving in between
         let initialSolanaSig: string | null = null;
         try {
             const [vaultPda] = deriveVaultPda(new PublicKey(solanaPublicKey.toBase58()), tokenMint);
@@ -440,38 +451,95 @@ export function BridgeForm() {
             console.warn("Could not get initial vault signature:", e);
         }
 
-        // Step 4: Call bridgePrivateToSolanaPlaintext (simpler approach - no client-side encryption needed)
-        // The contract encrypts the amount on-chain and emits plaintext in event for relayer
-        setStatus("Sending bridge transaction...");
-        const hash = await walletClient.writeContract({
+        // Step 3: Get user's nonce from the ConfidentialBridge contract
+        setStatus("Getting nonce...");
+        const senderNonce = await publicClient.readContract({
             address: CONFIDENTIAL_BRIDGE_ADDRESS as `0x${string}`,
             abi: BRIDGE_ABI,
-            functionName: "bridgePrivateToSolanaPlaintext",
-            args: [
-                CONFIDENTIAL_TOKEN_ADDRESS as `0x${string}`,
-                solanaBytes32 as `0x${string}`,
-                amountWei
-            ],
-            value: incoFee,
+            functionName: "getUserNonce",
+            args: [evmAddress],
         });
+        console.log("User nonce:", senderNonce.toString());
 
-        setTxHash(hash);
-        setStatus("Waiting for confirmation...");
+        // Step 4: Set deadline (5 minutes from now)
+        const deadline = BigInt(Math.floor(Date.now() / 1000) + 300);
 
-        const receipt = await publicClient.waitForTransactionReceipt({ hash });
+        // Step 5: Sign the message off-chain using personal_sign
+        // The contract verifies: keccak256("\x19Ethereum Signed Message:\n32", keccak256(abi.encodePacked(localToken, toSolana, encryptedAmount, senderNonce, deadline)))
+        setStatus("Signing private bridge request...");
+        const { keccak256: keccak256Hash, encodePacked, toBytes: viemToBytes } = await import("viem");
 
-        console.log("Bridge transaction confirmed:", receipt.transactionHash);
-        console.log("Block number:", receipt.blockNumber);
+        const innerHash = keccak256Hash(
+            encodePacked(
+                ["address", "bytes32", "bytes", "uint256", "uint256"],
+                [
+                    CONFIDENTIAL_TOKEN_ADDRESS as `0x${string}`,
+                    solanaBytes32 as `0x${string}`,
+                    encryptedHex,
+                    senderNonce,
+                    deadline,
+                ]
+            )
+        );
 
-        setStatus("Transaction confirmed");
+        // personal_sign will prefix with "\x19Ethereum Signed Message:\n32" automatically
+        const signature = await walletClient.signMessage({
+            message: { raw: viemToBytes(innerHash) },
+        });
+        console.log("Signed message, signature:", signature.slice(0, 20) + "...");
+
+        // Step 6: Send to relayer API — relayer calls bridgePrivateToSolanaViaRelayer
+        // The user's address is NOT the tx.from — only the relayer appears as sender
+        setStatus("Submitting via relayer (sender privacy)...");
+        const relayPayload = {
+            localToken: CONFIDENTIAL_TOKEN_ADDRESS,
+            toSolana: solanaBytes32,
+            encryptedAmount: encryptedHex,
+            sender: evmAddress,
+            senderNonce: senderNonce.toString(),
+            deadline: deadline.toString(),
+            signature: signature,
+            plaintextAmount: amountWei.toString(),
+        };
+
+        console.log("Posting to relayer /relay-bridge-to-solana:", { ...relayPayload, encryptedAmount: relayPayload.encryptedAmount.slice(0, 20) + "..." });
+        const relayResponse = await fetch(`${RELAYER_API_URL}/relay-bridge-to-solana`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(relayPayload),
+        });
+        const relayData = await relayResponse.json();
+        console.log("Relayer response:", relayData);
+
+        if (!relayResponse.ok) {
+            throw new Error(relayData.error || "Relayer failed to submit bridge transaction");
+        }
+
+        const baseTxHash = relayData.baseTxHash as string;
+        console.log("Base TX (via relayer):", baseTxHash);
+        // Don't set txHash to Base TX — we want to show the Solana destination TX
+
+        // Step 7: Wait for Solana relay
+        // The relayer also forwards the plaintext to Solana
+        if (relayData.solanaTxHash) {
+            console.log("Relay completed! Solana TX:", relayData.solanaTxHash);
+            setTxHash(relayData.solanaTxHash);
+            setRelayTxHash(relayData.solanaTxHash);
+            setRelayComplete(true);
+            setStatus("Tokens minted on Solana");
+            return;
+        }
+
+        setStatus("Bridge submitted — waiting for Solana relay...");
         setWaitingForRelay(true);
 
         // Poll for relay completion - pass Base TX hash for direct relayer lookup
-        pollForRelayCompletion("solana", receipt.blockNumber, initialHandle, initialSolanaSig, hash);
+        const startBlock = await publicClient.getBlockNumber();
+        pollForRelayCompletion("solana", startBlock, initialHandle, initialSolanaSig, baseTxHash);
     };
 
     const bridgeSolanaToBase = async () => {
-        if (!solanaPublicKey || !signTransaction || !evmAddress || !publicClient) {
+        if (!solanaPublicKey || !sendTransaction || !evmAddress || !publicClient) {
             setError("Please connect both wallets");
             return;
         }
@@ -492,27 +560,11 @@ export function BridgeForm() {
 
         const tokenMint = getTokenMint();
 
-        // Step 1: Check vault exists
-        setStatus("Checking vault...");
-        const exists = await checkVaultExists(connection, solanaPublicKey, tokenMint);
-        if (!exists) {
-            throw new Error("Solana vault does not exist. Bridge tokens TO Solana first.");
-        }
-
-        // Step 2: Check vault has balance
-        setStatus("Checking balance...");
-        const balance = await getVaultBalance(connection, solanaPublicKey, tokenMint);
-        if (balance === null || balance === 0n) {
-            throw new Error("Solana vault has no balance. Bridge tokens TO Solana first.");
-        }
-        console.log("Vault balance handle:", balance.toString());
-
-        // Step 3: Parse amount (in token units, not wei for Solana)
+        // Step 1: Parse amount
         const amountBigInt = BigInt(Math.floor(parseFloat(amount) * 1e18));
         console.log("Amount to bridge:", amountBigInt.toString());
 
         // IMPORTANT: Capture Base block RIGHT BEFORE sending Solana TX
-        // This ensures we only look for mint logs AFTER this exact moment
         let startBlock: bigint | null = null;
         try {
             startBlock = await publicClient.getBlockNumber();
@@ -521,20 +573,60 @@ export function BridgeForm() {
             console.warn("Could not get block number:", e);
         }
 
-        // Step 4: Send bridge_confidential_out transaction
-        setStatus("Sending Solana transaction...");
-        const signature = await bridgeConfidentialOut(
+        // Step 2: Build and send bridge_confidential_out transaction directly
+        // The user signs a real Solana transaction (amounts stay encrypted on-chain)
+        setStatus("Signing bridge transaction...");
+        const result = await bridgeConfidentialOutDirect(
             connection,
             solanaPublicKey,
             tokenMint,
             evmAddress,
             amountBigInt,
-            signTransaction
+            sendTransaction,
         );
 
-        console.log("Solana TX signature:", signature);
-        setTxHash(signature);
-        setStatus("Transaction confirmed");
+        const solanaTxSig = result.solanaTxHash;
+        console.log("Solana TX signature (via relayer):", solanaTxSig);
+        // Don't set txHash to Solana TX — we want to show the Base destination TX
+
+        // Step 3: Now the relayer has already submitted the Solana TX.
+        // We need to relay the plaintext to Base via /relay-to-base.
+        // The relayer endpoint /relay-bridge-out returns solanaTxHash after confirmation.
+        setStatus("Sending to relayer for Base minting...");
+        const relayPayload = {
+            solanaTxHash: solanaTxSig,
+            plaintextAmount: amountBigInt.toString(),
+            destinationEvm: evmAddress,
+            localToken: CONFIDENTIAL_TOKEN_ADDRESS,
+        };
+
+        console.log("Posting to relayer /relay-to-base:", relayPayload);
+        try {
+            const relayResponse = await fetch(`${RELAYER_API_URL}/relay-to-base`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(relayPayload),
+            });
+            const relayData = await relayResponse.json();
+            console.log("Relayer response:", relayData);
+
+            if (relayResponse.ok && relayData.txHash) {
+                console.log("Relay completed! Base TX:", relayData.txHash);
+                setTxHash(relayData.txHash);
+                setRelayTxHash(relayData.txHash);
+                setRelayComplete(true);
+                setStatus("Tokens minted on Base");
+                return;
+            }
+
+            if (!relayResponse.ok) {
+                console.warn("Relayer returned error:", relayData.error);
+            }
+        } catch (relayError) {
+            console.warn("Could not reach relayer API (will poll for completion):", relayError);
+        }
+
+        setStatus("Bridge submitted — waiting for Base mint...");
         setWaitingForRelay(true);
 
         // Poll for relay completion - pass the startBlock we captured before sending
@@ -710,7 +802,7 @@ export function BridgeForm() {
                                     </div>
                                     <div>
                                         <p className="text-xs text-gray-400 uppercase tracking-wider">
-                                            {txHash.startsWith("0x") ? "Base Transaction" : "Solana Transaction"}
+                                            {direction === "base-to-solana" ? "Solana Transaction" : "Base Transaction"}
                                         </p>
                                         <p className="text-sm font-mono text-white mt-0.5">
                                             {txHash.slice(0, 16)}...{txHash.slice(-12)}
